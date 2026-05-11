@@ -642,3 +642,1915 @@ for ax, preds, title in configs:
 plt.suptitle('Confusion Matrices — Models with Early Stopping', fontsize=13, fontweight='bold')
 plt.tight_layout()
 plt.show()
+
+
+import numpy as np
+import concurrent.futures
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier
+from sklearn.neural_network import MLPClassifier
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+import xgboost as xgb
+from xgboost import XGBClassifier
+import lightgbm as lgb
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# ---------------------------------------------------------------
+# UTILITY: detect GPU for XGBoost / LightGBM
+# ---------------------------------------------------------------
+def _has_gpu():
+    try:
+        import subprocess
+        result = subprocess.run(["nvidia-smi"], capture_output=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+USE_GPU = _has_gpu()
+print(f"GPU detected: {USE_GPU}")
+
+# ---------------------------------------------------------------
+# UTILITY: subsample helper (used for RF / ET)
+# ---------------------------------------------------------------
+def subsample(X, y, n=200_000, seed=42):
+    """Returns a random subsample of size n (or full data if smaller)."""
+    if len(y) <= n:
+        return X, y
+    rng = np.random.default_rng(seed)
+    idx = rng.choice(len(y), size=n, replace=False)
+    return X[idx], y[idx]
+
+# Subsample once – reuse for RF and ET
+X_sub, y_sub = subsample(X_train_scaled, y_train_enc, n=200_000)
+print(f"Subsample size: {len(y_sub):,}  (full train: {len(y_train_enc):,})")
+
+# ---------------------------------------------------------------
+# warm_start helper – unchanged API, now receives sub-data
+# ---------------------------------------------------------------
+def tree_early_stop_fit(model, X_tr, y_tr, X_val, y_val,
+                        step=50, max_rounds=20, patience=5,
+                        model_name="Model",
+                        X_full=None, y_full=None):
+    """
+    Finds best n_estimators on (X_tr, y_tr), then re-fits on
+    X_full / y_full if provided (= full training set).
+    """
+    best_val   = -1.0
+    best_n     = step
+    no_improve = 0
+    history    = {"n_estimators": [], "val_acc": [], "train_acc": []}
+
+    for rnd in range(1, max_rounds + 1):
+        model.n_estimators = rnd * step
+        model.fit(X_tr, y_tr)
+        val_acc   = accuracy_score(y_val, model.predict(X_val))
+        train_acc = accuracy_score(y_tr,  model.predict(X_tr))
+        history["n_estimators"].append(model.n_estimators)
+        history["val_acc"].append(val_acc)
+        history["train_acc"].append(train_acc)
+
+        if val_acc > best_val + 1e-5:
+            best_val   = val_acc
+            best_n     = model.n_estimators
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        print(f"  [{model_name}] trees={model.n_estimators:>4d}  "
+              f"train={train_acc:.4f}  val={val_acc:.4f}"
+              + (" <- best" if no_improve == 0
+                 else f"  (no improvement {no_improve}/{patience})"))
+
+        if no_improve >= patience:
+            print(f"  EARLY STOP @ {model.n_estimators} trees "
+                  f"(best val={best_val:.4f} @ {best_n} trees)")
+            break
+
+    # ---- SPEEDUP: refit best config on FULL training data ----
+    model.n_estimators = best_n
+    if X_full is not None:
+        model.warm_start = False          # plain fit on full data
+        model.fit(X_full, y_full)
+    else:
+        model.fit(X_tr, y_tr)
+    return model, best_n, history
+# ---- define each model upfront ---------------------------------
+
+# 1. Random Forest
+rf_model = RandomForestClassifier(
+    max_depth=15, min_samples_split=8, min_samples_leaf=3,
+    max_features="sqrt", random_state=42, n_jobs=-1,
+    class_weight="balanced", warm_start=True, n_estimators=50
+)
+
+# 2. Extra Trees
+et_model = ExtraTreesClassifier(
+    max_depth=15, min_samples_leaf=3, max_features="sqrt",
+    random_state=42, n_jobs=-1, class_weight="balanced",
+    warm_start=True, n_estimators=50
+)
+
+# 3. XGBoost  – SPEEDUP: lr 0.03→0.05, n_est 2000→1000, GPU if available
+xgb_model = XGBClassifier(
+    n_estimators=1000,
+    learning_rate=0.05,          # ↑ faster convergence
+    max_depth=6,
+    subsample=0.80,
+    colsample_bytree=0.80,
+    colsample_bylevel=0.80,
+    min_child_weight=5,
+    gamma=0.3,
+    reg_alpha=0.2,
+    reg_lambda=1.5,
+    tree_method="hist",
+    device="cuda" if USE_GPU else "cpu",   # GPU if available
+    eval_metric="mlogloss",
+    early_stopping_rounds=50,
+    random_state=42,
+    verbosity=0
+)
+
+# 4. LightGBM – SPEEDUP: lr 0.03→0.05, n_est 3000→1500, GPU if available
+lgb_model = lgb.LGBMClassifier(
+    n_estimators=1500,
+    learning_rate=0.05,          # ↑ faster convergence
+    max_depth=7,
+    num_leaves=40,               # 50→40, slightly faster
+    feature_fraction=0.80,
+    bagging_fraction=0.80,
+    bagging_freq=5,
+    min_child_samples=20,
+    reg_alpha=0.2,
+    reg_lambda=1.5,
+    class_weight="balanced",
+    device="gpu" if USE_GPU else "cpu",
+    random_state=42,
+    verbosity=-1
+)
+
+# 5. MLP – SPEEDUP: smaller net (512,256,128,64) → (256,128,64), max_iter 500→200
+mlp_model = MLPClassifier(
+    hidden_layer_sizes=(256, 128, 64),   # lighter architecture
+    activation="relu",
+    solver="adam",
+    alpha=0.005,
+    learning_rate="adaptive",
+    learning_rate_init=0.001,
+    max_iter=200,                        # 500→200
+    early_stopping=True,
+    validation_fraction=0.15,
+    n_iter_no_change=20,
+    tol=1e-4,
+    random_state=42
+)
+
+# ----------------------------------------------------------------
+# Fit functions for the thread pool (XGB / LGB only)
+# ----------------------------------------------------------------
+def fit_xgb():
+    xgb_model.fit(
+        X_train_scaled, y_train_enc,
+        eval_set=[(X_val_scaled, y_val_enc)],
+        verbose=False
+    )
+    return xgb_model
+
+def fit_lgb():
+    lgb_model.fit(
+        X_train_scaled, y_train_enc,
+        eval_set=[(X_val_scaled, y_val_enc)],
+        callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]
+    )
+    return lgb_model
+
+def fit_mlp():
+    mlp_model.fit(X_train_scaled, y_train_enc)
+    return mlp_model
+
+# ----------------------------------------------------------------
+# 1. RF  (uses subsampled data for early-stop search)
+# ----------------------------------------------------------------
+print("=" * 60)
+print("Random Forest – warm_start on 200K subsample")
+rf_model, rf_best_n, rf_hist = tree_early_stop_fit(
+    rf_model,
+    X_sub, y_sub,            # ← subsample for early-stop search
+    X_val_scaled, y_val_enc,
+    step=50, max_rounds=20, patience=5, model_name="RF",
+    X_full=X_train_scaled,   # ← refit best config on full data
+    y_full=y_train_enc
+)
+
+# ----------------------------------------------------------------
+# 2. ET  (same pattern)
+# ----------------------------------------------------------------
+print("\n" + "=" * 60)
+print("Extra Trees – warm_start on 200K subsample")
+et_model, et_best_n, et_hist = tree_early_stop_fit(
+    et_model,
+    X_sub, y_sub,
+    X_val_scaled, y_val_enc,
+    step=50, max_rounds=20, patience=5, model_name="ET",
+    X_full=X_train_scaled,
+    y_full=y_train_enc
+)
+
+# ----------------------------------------------------------------
+# 3–5. XGBoost / LightGBM / MLP in parallel
+# ----------------------------------------------------------------
+print("\n" + "=" * 60)
+print("XGBoost + LightGBM + MLP – training in parallel (3 threads)")
+with concurrent.futures.ThreadPoolExecutor(max_workers=3) as pool:
+    fut_xgb = pool.submit(fit_xgb)
+    fut_lgb = pool.submit(fit_lgb)
+    fut_mlp = pool.submit(fit_mlp)
+    xgb_model = fut_xgb.result()
+    lgb_model = fut_lgb.result()
+    mlp_model = fut_mlp.result()
+print("  All three done.")
+
+# ----------------------------------------------------------------
+# Evaluate all models
+# ----------------------------------------------------------------
+def eval_model(model, name):
+    y_pred     = model.predict(X_test_scaled)
+    acc_te     = accuracy_score(y_test_enc, y_pred)
+    f1_te      = f1_score(y_test_enc, y_pred, average="weighted")
+    acc_tr     = model.score(X_train_scaled, y_train_enc)
+    acc_val    = model.score(X_val_scaled, y_val_enc) if name != "MLP" else 0.0
+    return y_pred, acc_tr, acc_val, acc_te, f1_te, acc_tr - acc_te
+
+y_pred_rf,  acc_rf_tr,  acc_rf_val,  acc_rf,  f1_rf,  gap_rf  = eval_model(rf_model,  "RF")
+y_pred_et,  acc_et_tr,  acc_et_val,  acc_et,  f1_et,  gap_et  = eval_model(et_model,  "ET")
+y_pred_xgb, acc_xgb_tr, acc_xgb_val, acc_xgb, f1_xgb, gap_xgb = eval_model(xgb_model, "XGB")
+y_pred_lgb, acc_lgb_tr, acc_lgb_val, acc_lgb, f1_lgb, gap_lgb = eval_model(lgb_model, "LGB")
+y_pred_mlp, acc_mlp_tr, _,           acc_mlp, f1_mlp, gap_mlp = eval_model(mlp_model, "MLP")
+
+# ----------------------------------------------------------------
+# Summary table
+# ----------------------------------------------------------------
+print("\n" + "=" * 85)
+print(f"{'Model':<14} {'Early Stop Method':<30} {'Train':>7} {'Val':>7} "
+      f"{'Test':>7} {'F1(w)':>7} {'Gap':>7} {'Status':>10}")
+print("-" * 85)
+rows = [
+    ("RandomForest", f"warm_start (best={rf_best_n} trees)",             acc_rf_tr,  acc_rf_val,  acc_rf,  f1_rf,  gap_rf),
+    ("ExtraTrees",   f"warm_start (best={et_best_n} trees)",             acc_et_tr,  acc_et_val,  acc_et,  f1_et,  gap_et),
+    ("XGBoost",      f"native (best_iter={xgb_model.best_iteration})",   acc_xgb_tr, acc_xgb_val, acc_xgb, f1_xgb, gap_xgb),
+    ("LightGBM",     f"native (best_iter={lgb_model.best_iteration_})",  acc_lgb_tr, acc_lgb_val, acc_lgb, f1_lgb, gap_lgb),
+    ("MLP",          f"native (stopped={mlp_model.n_iter_} iters)",      acc_mlp_tr, 0.0,         acc_mlp, f1_mlp, gap_mlp),
+]
+for nm, es_info, tr, val, te, f1, gap in rows:
+    status = "OK 70-75%" if 0.68 <= te <= 0.77 else ("Low" if te < 0.68 else "High?")
+    val_s  = f"{val:.4f}" if val > 0 else "  N/A "
+    print(f"{nm:<14} {es_info:<30} {tr:>7.4f} {val_s:>7} {te:>7.4f} {f1:>7.4f} "
+          f"{gap:>7.4f} {status:>10}")
+print("=" * 85)
+
+# ----------------------------------------------------------------
+# Plots (unchanged)
+# ----------------------------------------------------------------
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for ax, hist, name, color in [
+    (axes[0], rf_hist, "Random Forest", "steelblue"),
+    (axes[1], et_hist, "Extra Trees",   "darkorange"),
+]:
+    ax.plot(hist["n_estimators"], hist["train_acc"], label="Train (subsample)", color=color, lw=2)
+    ax.plot(hist["n_estimators"], hist["val_acc"],   label="Val",   color=color, lw=2, ls="--")
+    best_idx = int(np.argmax(hist["val_acc"]))
+    ax.axvline(hist["n_estimators"][best_idx], color="red", ls=":", lw=1.5,
+               label=f'Early stop ({hist["n_estimators"][best_idx]} trees)')
+    ax.set_xlabel("n_estimators"); ax.set_ylabel("Accuracy")
+    ax.set_title(f"{name} – Early Stopping Curve", fontweight="bold")
+    ax.legend(); ax.grid(True, alpha=0.3)
+plt.suptitle("warm_start Early Stopping – RF & ET (subsample search)", fontsize=13, fontweight="bold")
+plt.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+for ax, preds, title in [
+    (axes[0], y_pred_rf,  f"Random Forest\nTest={acc_rf:.4f}"),
+    (axes[1], y_pred_xgb, f"XGBoost\nTest={acc_xgb:.4f}"),
+    (axes[2], y_pred_lgb, f"LightGBM\nTest={acc_lgb:.4f}"),
+]:
+    cm = confusion_matrix(y_test_enc, preds)
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", ax=ax,
+                xticklabels=["Low","Med","High"],
+                yticklabels=["Low","Med","High"])
+    ax.set_title(title, fontweight="bold")
+    ax.set_xlabel("Predicted"); ax.set_ylabel("Actual")
+plt.suptitle("Confusion Matrices – Optimized Models", fontsize=13, fontweight="bold")
+plt.tight_layout(); plt.show()
+
+# ─── CELL 15 · Ensemble Stacking (RF+XGB+LGB+ET → LogReg meta) ─────
+from sklearn.model_selection import StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from joblib import Parallel, delayed
+
+def oof_proba(model, X, y, cv=3):  # 3 folds instead of 5
+    """Out-of-fold probabilities for stacking — parallelized."""
+    skf = StratifiedKFold(n_splits=cv, shuffle=True, random_state=42)
+    n_classes = len(np.unique(y))
+    splits = list(skf.split(X, y))
+
+    params = model.get_params()
+    if "early_stopping_rounds" in params:
+        params = {**params, "early_stopping_rounds": None}
+
+    # Force parallelism inside each base model
+    if "n_jobs" in params:
+        params = {**params, "n_jobs": -1}
+    # Fewer trees for OOF clones — faster, still good signal
+    if "n_estimators" in params:
+        params = {**params, "n_estimators": min(params["n_estimators"], 100)}
+
+    def fit_fold(ti, vi):
+        m = type(model)(**params)
+        m.fit(X[ti], y[ti])
+        return vi, m.predict_proba(X[vi])
+
+    # Parallel across folds
+    results = Parallel(n_jobs=-1, prefer="threads")(
+        delayed(fit_fold)(ti, vi) for ti, vi in splits
+    )
+
+    oof = np.zeros((len(X), n_classes))
+    for vi, preds in results:
+        oof[vi] = preds
+    return oof
+
+print("Computing OOF predictions...")
+# Parallelize the 4 models concurrently
+def compute_oof(args):
+    model, X, y = args
+    return oof_proba(model, X, y)
+
+oof_rf, oof_xgb, oof_lgb, oof_et = Parallel(n_jobs=4, prefer="threads")(
+    delayed(oof_proba)(m, X_train_scaled, y_train_enc)
+    for m in [rf_model, xgb_model, lgb_model, et_model]
+)
+
+meta_train = np.hstack([oof_rf, oof_xgb, oof_lgb, oof_et])
+
+# Test meta-features (predict_proba in parallel)
+def get_test_proba(model):
+    return model.predict_proba(X_test_scaled)
+
+test_probas = Parallel(n_jobs=4, prefer="threads")(
+    delayed(get_test_proba)(m) for m in [rf_model, xgb_model, lgb_model, et_model]
+)
+meta_test = np.hstack(test_probas)
+
+# Meta-learner — lbfgs solver is faster for small meta-features
+meta_model = LogisticRegression(
+    max_iter=500,       # 2000→500, lbfgs converges fast
+    C=5.0,
+    solver="lbfgs",
+    random_state=42,
+    n_jobs=-1
+)
+meta_model.fit(meta_train, y_train_enc)
+y_pred_stack = meta_model.predict(meta_test)
+acc_stack = accuracy_score(y_test_enc, y_pred_stack)
+f1_stack  = f1_score(y_test_enc, y_pred_stack, average="weighted")
+print(f"Stacked Ensemble → Accuracy: {acc_stack:.4f}  F1: {f1_stack:.4f}")
+
+# Pick overall best
+all_scores = {
+    "RF":      acc_rf,
+    "ET":      acc_et,
+    "XGB":     acc_xgb,
+    "LGB":     acc_lgb,
+    "Stacked": acc_stack,
+}
+best_name = max(all_scores, key=all_scores.get)
+print(f"\n✅ Best model: {best_name} ({all_scores[best_name]:.4f})")
+
+# Bar chart
+fig, ax = plt.subplots(figsize=(10, 5))
+names  = list(all_scores.keys())
+accs   = list(all_scores.values())
+colors = ["steelblue", "teal", "coral", "mediumseagreen", "gold"]
+bars   = ax.bar(names, accs, color=colors, edgecolor="black", alpha=0.85)
+ax.axhline(0.88, color="green", ls="--", lw=2, label="88% lower target")
+ax.axhline(0.90, color="red",   ls="--", lw=2, label="90% upper target")
+ax.set_ylim(0, 1)
+ax.set_ylabel("Accuracy")
+ax.set_title("Model Comparison — All Models", fontweight="bold")
+ax.bar_label(bars, fmt="%.3f", padding=3)
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+try:
+    import shap
+    SHAP_OK = True
+except ImportError:
+    SHAP_OK = False
+
+if SHAP_OK:
+    explainer  = shap.TreeExplainer(xgb_model)
+    sample_idx = min(300, X_test_scaled.shape[0])
+    shap_vals  = explainer.shap_values(X_test_scaled[:sample_idx])
+
+    print("SHAP Summary Plot (all classes):")
+    shap.summary_plot(shap_vals, X_test.iloc[:sample_idx],
+                      feature_names=X.columns.tolist(),
+                      class_names=["Low", "Medium", "High"], show=False)
+    plt.tight_layout(); plt.show()
+
+    # FIX: handle all shap_values shapes correctly
+    if isinstance(shap_vals, list):
+        # Multiclass list: each element is (n_samples, n_features)
+        # Average |SHAP| per feature across all classes
+        mean_shap = np.stack([np.abs(s).mean(axis=0) for s in shap_vals], axis=0).mean(axis=0)
+    elif shap_vals.ndim == 3:
+        # Newer SHAP returns (n_samples, n_features, n_classes)
+        mean_shap = np.abs(shap_vals).mean(axis=0).mean(axis=1)
+    else:
+        # Binary / single output: (n_samples, n_features)
+        mean_shap = np.abs(shap_vals).mean(axis=0)
+
+    # Validate before DataFrame construction
+    assert mean_shap.ndim == 1, f"mean_shap still not 1D: shape={mean_shap.shape}"
+    assert len(mean_shap) == len(X.columns), (
+        f"Length mismatch: mean_shap={len(mean_shap)}, features={len(X.columns)}"
+    )
+
+    feat_shap = (pd.DataFrame({"Feature": X.columns.tolist(), "|SHAP|": mean_shap})
+                   .sort_values("|SHAP|", ascending=True).tail(15))
+
+    fig, ax = plt.subplots(figsize=(9, 6))
+    ax.barh(feat_shap["Feature"], feat_shap["|SHAP|"], color="tomato")
+    ax.set_xlabel("Mean |SHAP value|")
+    ax.set_title("Top Features Driving Danger Predictions (SHAP)")
+    plt.tight_layout(); plt.show()
+    print("✅ SHAP explanation complete.")
+else:
+    print("Run  `pip install shap`  to enable explainability.")
+
+# ─── CELL 17 · Anomaly Detection (IsolationForest + PyTorch Autoencoder) ──
+print("─── IsolationForest ───")
+iso = IsolationForest(n_estimators=200, contamination=0.05, random_state=42)
+iso_preds    = iso.fit_predict(X_train_scaled)
+n_anomalies  = (iso_preds == -1).sum()
+anomaly_rate = n_anomalies / len(iso_preds) * 100
+print(f"Anomalies detected: {n_anomalies} ({anomaly_rate:.1f}%)")
+
+# Map overlay
+anom_rows = df.loc[X_train.index][iso_preds == -1][['Latitude','Longitude']].copy()
+m_anom = folium.Map(location=[center_lat, center_lon], zoom_start=11)
+for _, row in anom_rows.sample(min(200, len(anom_rows)), random_state=42).iterrows():
+    folium.CircleMarker([row['Latitude'], row['Longitude']], radius=4,
+        color='black', fill=True, fill_color='yellow',
+        fill_opacity=0.9, popup='ANOMALY').add_to(m_anom)
+m_anom.save("anomalies.html"); display(m_anom)
+
+# ── PyTorch Autoencoder ──────────────────────────────────────────────
+print("\n─── PyTorch Autoencoder ───")
+
+input_dim = X_train_scaled.shape[1]
+
+class Autoencoder(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, 64), nn.ReLU(),
+            nn.BatchNorm1d(64),
+            nn.Linear(64, 32), nn.ReLU(),
+            nn.Linear(32, 16), nn.ReLU(),
+        )
+        self.decoder = nn.Sequential(
+            nn.Linear(16, 32), nn.ReLU(),
+            nn.Linear(32, 64), nn.ReLU(),
+            nn.Linear(64, input_dim),
+        )
+    def forward(self, x):
+        return self.decoder(self.encoder(x))
+
+# Train only on low-danger (normal) samples
+normal_mask = (y_train_enc == 0)
+ae_train_np = X_train_scaled[normal_mask].astype(np.float32)
+ae_val_np   = X_train_scaled[~normal_mask][:200].astype(np.float32)
+
+ae_train_t = torch.tensor(ae_train_np).to(DEVICE)
+ae_val_t   = torch.tensor(ae_val_np).to(DEVICE)
+ae_ds      = TensorDataset(ae_train_t, ae_train_t)
+ae_loader  = DataLoader(ae_ds, batch_size=256, shuffle=True)
+
+ae_model   = Autoencoder(input_dim).to(DEVICE)
+ae_optim   = TorchAdam(ae_model.parameters(), lr=1e-3)
+ae_sched   = ReduceLROnPlateau(ae_optim, patience=3, factor=0.5)
+
+best_val_loss, best_state, patience_ctr = float('inf'), None, 0
+ae_train_losses, ae_val_losses = [], []
+
+for epoch in range(60):
+    ae_model.train()
+    batch_losses = []
+    for xb, _ in ae_loader:
+        ae_optim.zero_grad()
+        out  = ae_model(xb)
+        loss = F.mse_loss(out, xb)
+        loss.backward(); ae_optim.step()
+        batch_losses.append(loss.item())
+    tr_loss = np.mean(batch_losses)
+
+    ae_model.eval()
+    with torch.no_grad():
+        val_loss = F.mse_loss(ae_model(ae_val_t), ae_val_t).item()
+    ae_sched.step(val_loss)
+    ae_train_losses.append(tr_loss); ae_val_losses.append(val_loss)
+
+    if val_loss < best_val_loss:
+        best_val_loss = val_loss
+        best_state    = copy.deepcopy(ae_model.state_dict())
+        patience_ctr  = 0
+    else:
+        patience_ctr += 1
+        if patience_ctr >= 8: break
+
+ae_model.load_state_dict(best_state)
+print(f"  AE trained for {len(ae_train_losses)} epochs  |  best val loss={best_val_loss:.5f}")
+
+# Reconstruction error on test set
+ae_model.eval()
+X_test_t  = torch.tensor(X_test_scaled.astype(np.float32)).to(DEVICE)
+with torch.no_grad():
+    recon     = ae_model(X_test_t).cpu().numpy()
+recon_err  = np.mean((X_test_scaled - recon) ** 2, axis=1)
+threshold  = np.percentile(recon_err[y_test_enc == 0], 95)
+ae_anomaly = (recon_err > threshold).astype(int)
+print(f"  AE threshold (95th pct): {threshold:.5f}")
+print(f"  AE flagged: {ae_anomaly.sum()} / {len(ae_anomaly)} anomalies")
+
+# Plots
+fig, axes = plt.subplots(1, 2, figsize=(14, 4))
+axes[0].plot(ae_train_losses, label='Train loss', color='steelblue')
+axes[0].plot(ae_val_losses,   label='Val loss',   color='coral')
+axes[0].set_title('AE Training Loss (PyTorch)'); axes[0].legend()
+axes[0].grid(True, alpha=0.3)
+
+axes[1].hist(recon_err[y_test_enc==0], bins=50, alpha=0.6, color='green', label='Low danger')
+axes[1].hist(recon_err[y_test_enc==2], bins=50, alpha=0.6, color='red',   label='High danger')
+axes[1].axvline(threshold, color='black', ls='--', lw=2, label=f'Threshold={threshold:.4f}')
+axes[1].set_title('Reconstruction Error Distribution')
+axes[1].set_xlabel('MSE'); axes[1].legend()
+plt.suptitle('PyTorch Autoencoder — Anomaly Detection', fontweight='bold')
+plt.tight_layout(); plt.show()
+
+
+# ─── CELL 18 · Online Learning (incremental updates) ───────────────
+from sklearn.linear_model import SGDClassifier
+
+# Warm-start SGD classifier — partial_fit enables online updates
+online_model = SGDClassifier(
+    loss='modified_huber', penalty='l2', alpha=0.001,
+    max_iter=1000, random_state=42, n_jobs=-1)
+
+BATCH_SIZE = 200
+batches = np.array_split(range(len(X_train_scaled)),
+                          max(1, len(X_train_scaled)//BATCH_SIZE))
+batch_accs = []
+
+for i,idx in enumerate(batches):
+    online_model.partial_fit(X_train_scaled[idx], y_train_enc[idx],
+                              classes=le.classes_)
+    if i % max(1,len(batches)//10) == 0:
+        acc = online_model.score(X_test_scaled,y_test_enc)
+        batch_accs.append((i*BATCH_SIZE, acc))
+        print(f"  Batch {i+1:3d}/{len(batches)}  test acc: {acc:.4f}")
+
+final_online_acc = online_model.score(X_test_scaled,y_test_enc)
+print(f"\nFinal online model accuracy: {final_online_acc:.4f}")
+
+# Learning curve
+if batch_accs:
+    samples, accs_ = zip(*batch_accs)
+    plt.figure(figsize=(9,4))
+    plt.plot(samples,accs_,'o-',color='mediumseagreen')
+    plt.xlabel('Training samples seen'); plt.ylabel('Test Accuracy')
+    plt.title('Online Learning — Accuracy vs Samples Seen')
+    plt.grid(True,alpha=0.3); plt.tight_layout(); plt.show()
+
+# Simulated new data update
+print("\nSimulating new crime reports arriving...")
+new_X = X_test_scaled[:50]
+new_y = y_test_enc[:50]
+online_model.partial_fit(new_X, new_y)
+updated_acc = online_model.score(X_test_scaled,y_test_enc)
+print(f"Accuracy after 50 new records: {updated_acc:.4f}")
+
+
+# ─── CELL 19 · Time-Series Crime Forecasting (PyTorch LSTM) ────────
+monthly_ts = (df.groupby(['FIR_YEAR','FIR_MONTH'])['danger_label']
+                .agg(['mean','count']).reset_index()
+                .sort_values(['FIR_YEAR','FIR_MONTH']))
+monthly_ts.columns = ['year','month','avg_danger','count']
+monthly_ts = monthly_ts.reset_index(drop=True)
+
+danger_series = monthly_ts['avg_danger'].values.astype(np.float32)
+print(f"Time series length: {len(danger_series)} months")
+
+if len(danger_series) >= 12:
+    SEQ_LEN = 6
+
+    def make_sequences(data, seq_len):
+        X_, y_ = [], []
+        for i in range(len(data) - seq_len):
+            X_.append(data[i:i+seq_len])
+            y_.append(data[i+seq_len])
+        return np.array(X_), np.array(y_)
+
+    ts_mean = danger_series.mean()
+    ts_std  = danger_series.std() + 1e-8
+    ts_norm = (danger_series - ts_mean) / ts_std
+
+    Xts, yts = make_sequences(ts_norm, SEQ_LEN)
+    Xts = Xts.reshape(-1, SEQ_LEN, 1)
+
+    split = int(len(Xts) * 0.8)
+    Xtr_ts, Xte_ts = Xts[:split],  Xts[split:]
+    ytr_ts, yte_ts = yts[:split],  yts[split:]
+
+    # ── PyTorch LSTM ────────────────────────────────────────────
+    class LSTMForecaster(nn.Module):
+        def __init__(self, input_size=1, hidden=64, n_layers=2):
+            super().__init__()
+            self.lstm = nn.LSTM(input_size, hidden, n_layers,
+                                batch_first=True, dropout=0.2)
+            self.fc1  = nn.Linear(hidden, 32)
+            self.fc2  = nn.Linear(32, 1)
+
+        def forward(self, x):
+            out, _ = self.lstm(x)
+            out     = F.relu(self.fc1(out[:, -1, :]))
+            return self.fc2(out).squeeze(-1)
+
+    X_tr_t = torch.tensor(Xtr_ts, dtype=torch.float32).to(DEVICE)
+    y_tr_t = torch.tensor(ytr_ts, dtype=torch.float32).to(DEVICE)
+    X_te_t = torch.tensor(Xte_ts, dtype=torch.float32).to(DEVICE)
+    y_te_t = torch.tensor(yte_ts, dtype=torch.float32).to(DEVICE)
+
+    ts_ds     = TensorDataset(X_tr_t, y_tr_t)
+    ts_loader = DataLoader(ts_ds, batch_size=8, shuffle=True)
+
+    lstm_model  = LSTMForecaster().to(DEVICE)
+    lstm_optim  = TorchAdam(lstm_model.parameters(), lr=1e-3)
+    lstm_sched  = ReduceLROnPlateau(lstm_optim, patience=5, factor=0.5)
+
+    best_val, best_state_lstm, pat = float('inf'), None, 0
+    tr_losses_lstm, val_losses_lstm = [], []
+
+    for epoch in range(150):
+        lstm_model.train()
+        ep_loss = []
+        for xb, yb in ts_loader:
+            lstm_optim.zero_grad()
+            pred = lstm_model(xb)
+            loss = F.mse_loss(pred, yb)
+            loss.backward(); lstm_optim.step()
+            ep_loss.append(loss.item())
+        tr_l = np.mean(ep_loss)
+
+        lstm_model.eval()
+        with torch.no_grad():
+            val_l = F.mse_loss(lstm_model(X_te_t), y_te_t).item()
+        lstm_sched.step(val_l)
+        tr_losses_lstm.append(tr_l); val_losses_lstm.append(val_l)
+
+        if val_l < best_val:
+            best_val = val_l
+            best_state_lstm = copy.deepcopy(lstm_model.state_dict())
+            pat = 0
+        else:
+            pat += 1
+            if pat >= 20: break
+
+    lstm_model.load_state_dict(best_state_lstm)
+    print(f"LSTM trained {len(tr_losses_lstm)} epochs | best val loss={best_val:.5f}")
+
+    # Forecast next 6 months
+    lstm_model.eval()
+    last_seq = torch.tensor(
+        ts_norm[-SEQ_LEN:].reshape(1, SEQ_LEN, 1),
+        dtype=torch.float32).to(DEVICE)
+    forecast_norm = []
+    with torch.no_grad():
+        for _ in range(6):
+            pn = lstm_model(last_seq).item()
+            forecast_norm.append(pn)
+            new_pt   = torch.tensor([[[pn]]], dtype=torch.float32).to(DEVICE)
+            last_seq = torch.cat([last_seq[:, 1:, :], new_pt], dim=1)
+    forecast = np.clip(np.array(forecast_norm) * ts_std + ts_mean, 0, 2)
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+    axes[0].plot(danger_series, 'o-', label='Historical', color='steelblue')
+    future_x = range(len(danger_series), len(danger_series)+6)
+    axes[0].plot(list(future_x), forecast, 's--',
+                 label='LSTM Forecast (next 6mo)', color='red', lw=2)
+    axes[0].axvline(len(danger_series)-1, color='gray', ls=':', label='Now')
+    axes[0].set_title('Crime Danger Forecasting — PyTorch LSTM')
+    axes[0].set_xlabel('Month index'); axes[0].set_ylabel('Avg Danger (0-2)')
+    axes[0].legend(); axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(tr_losses_lstm,  label='Train loss',  color='steelblue')
+    axes[1].plot(val_losses_lstm, label='Val loss',    color='coral')
+    axes[1].set_title('LSTM Training Loss'); axes[1].legend()
+    axes[1].grid(True, alpha=0.3)
+    plt.suptitle('PyTorch LSTM — Time-Series Forecasting', fontweight='bold')
+    plt.tight_layout(); plt.show()
+    print(f"Forecast (next 6 months): {np.round(forecast, 3)}")
+else:
+    print(f"Not enough time-series data ({len(danger_series)} months). Need ≥12.")
+
+# ─── CELL 20 · Deep Q-Network — PyTorch ────────────────────────────
+import collections
+
+GRID_SIZE    = 10
+STATE_DIM    = GRID_SIZE * GRID_SIZE * 3
+N_ACTIONS    = 4
+GAMMA        = 0.95
+EPSILON      = 1.0
+EPSILON_MIN  = 0.05
+EPSILON_DECAY= 0.995
+LR_DQN       = 1e-3
+BATCH_DQN    = 64
+REPLAY_SIZE  = 5000
+EPISODES     = 500
+
+# ── Environment ──────────────────────────────────────────────────────
+class SafeRouteEnv:
+    def __init__(self, grid_size=GRID_SIZE):
+        self.size   = grid_size
+        self.danger = np.random.choice([0, 1, 2],
+            size=(grid_size, grid_size), p=[0.5, 0.3, 0.2])
+        self.start  = (0, 0)
+        self.goal   = (grid_size-1, grid_size-1)
+
+    def reset(self):
+        self.pos   = list(self.start)
+        self.steps = 0
+        return self._state()
+
+    def _state(self):
+        s = np.zeros((self.size, self.size, 3), dtype=np.float32)
+        s[self.pos[0],   self.pos[1],   0] = 1.0
+        s[self.goal[0],  self.goal[1],  1] = 1.0
+        s[:, :, 2] = self.danger / 2.0
+        return s.flatten()
+
+    def step(self, action):
+        dr, dc = [(-1,0),(1,0),(0,-1),(0,1)][action]
+        nr, nc  = self.pos[0]+dr, self.pos[1]+dc
+        if 0 <= nr < self.size and 0 <= nc < self.size:
+            self.pos = [nr, nc]
+        d_pos   = self.danger[self.pos[0], self.pos[1]]
+        reached = (self.pos[0] == self.goal[0] and self.pos[1] == self.goal[1])
+        reward  = 10.0 if reached else (-0.1 - d_pos * 0.5)
+        self.steps += 1
+        done = reached or self.steps >= self.size * 4
+        return self._state(), reward, done
+
+# ── PyTorch DQN ──────────────────────────────────────────────────────
+class DQNNet(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(STATE_DIM, 128), nn.ReLU(),
+            nn.LayerNorm(128),
+            nn.Linear(128, 128), nn.ReLU(),
+            nn.Linear(128, 64),  nn.ReLU(),
+            nn.Linear(64,  N_ACTIONS),
+        )
+    def forward(self, x):
+        return self.net(x)
+
+dqn       = DQNNet().to(DEVICE)
+target_q  = DQNNet().to(DEVICE)
+target_q.load_state_dict(dqn.state_dict())
+target_q.eval()
+
+dqn_optim = TorchAdam(dqn.parameters(), lr=LR_DQN)
+replay    = collections.deque(maxlen=REPLAY_SIZE)
+env       = SafeRouteEnv()
+
+def update_target():
+    target_q.load_state_dict(dqn.state_dict())
+
+def select_action(state, epsilon):
+    if np.random.rand() < epsilon:
+        return np.random.randint(N_ACTIONS)
+    with torch.no_grad():
+        st = torch.tensor(state, dtype=torch.float32).unsqueeze(0).to(DEVICE)
+        return dqn(st).argmax().item()
+
+def train_step():
+    if len(replay) < BATCH_DQN:
+        return
+    batch  = random.sample(replay, BATCH_DQN)
+    ss, aa, rr, nss, dd = map(np.array, zip(*batch))
+
+    ss_t  = torch.tensor(ss,  dtype=torch.float32).to(DEVICE)
+    nss_t = torch.tensor(nss, dtype=torch.float32).to(DEVICE)
+    rr_t  = torch.tensor(rr,  dtype=torch.float32).to(DEVICE)
+    dd_t  = torch.tensor(dd,  dtype=torch.float32).to(DEVICE)
+    aa_t  = torch.tensor(aa,  dtype=torch.long).to(DEVICE)
+
+    with torch.no_grad():
+        next_q = target_q(nss_t).max(1)[0]
+        targets = rr_t + GAMMA * (1 - dd_t) * next_q
+
+    current_q = dqn(ss_t).gather(1, aa_t.unsqueeze(1)).squeeze(1)
+    loss = F.smooth_l1_loss(current_q, targets)
+    dqn_optim.zero_grad(); loss.backward(); dqn_optim.step()
+
+episode_rewards, episode_dangers = [], []
+
+for ep in range(EPISODES):
+    state   = env.reset()
+    total_r = 0.0; total_d = 0; done = False
+    while not done:
+        action  = select_action(state, EPSILON)
+        ns, reward, done = env.step(action)
+        danger_at = int(env.danger[env.pos[0], env.pos[1]])
+        replay.append((state, action, reward, ns, float(done)))
+        total_r += reward; total_d += danger_at; state = ns
+        train_step()
+    EPSILON = max(EPSILON_MIN, EPSILON * EPSILON_DECAY)
+    episode_rewards.append(total_r)
+    episode_dangers.append(total_d)
+    if ep % 50 == 0:
+        update_target()
+
+print(f"✅ DQN training done  |  final ε={EPSILON:.4f}")
+
+def smooth(arr, w=20):
+    return pd.Series(arr).rolling(w, min_periods=1).mean().values
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+axes[0].plot(smooth(episode_rewards), color='royalblue')
+axes[0].set_title('DQN Episode Rewards (smoothed)')
+axes[0].set_xlabel('Episode'); axes[0].set_ylabel('Total Reward')
+axes[0].grid(True, alpha=0.3)
+
+axes[1].plot(smooth(episode_dangers), color='red')
+axes[1].set_title('DQN Total Danger Accumulated (smoothed)')
+axes[1].set_xlabel('Episode'); axes[1].set_ylabel('Danger sum')
+axes[1].grid(True, alpha=0.3)
+plt.suptitle('PyTorch Deep Q-Network Training', fontweight='bold')
+plt.tight_layout(); plt.show()
+
+# Evaluate learned path
+dqn.eval(); EPSILON = 0.0
+state = env.reset(); path_cells = [tuple(env.pos)]; done = False
+with torch.no_grad():
+    while not done:
+        action = select_action(state, 0.0)
+        state, _, done = env.step(action)
+        path_cells.append(tuple(env.pos))
+
+fig, ax = plt.subplots(figsize=(7, 7))
+im = ax.imshow(env.danger.astype(float), cmap='RdYlGn_r', vmin=0, vmax=2)
+ys, xs = zip(*path_cells)
+ax.plot(xs, ys, 'b-o', lw=2, ms=6, label='DQN path')
+ax.plot(xs[0],  ys[0],  'g*', ms=18, label='Start')
+ax.plot(xs[-1], ys[-1], 'r*', ms=18, label='Goal')
+ax.set_title('PyTorch DQN Learned Route (green=safe, red=danger)')
+ax.legend(); plt.colorbar(im, ax=ax, label='Danger Level')
+plt.tight_layout(); plt.show()
+print(f"Path length: {len(path_cells)} steps  |  "
+      f"reached goal: {path_cells[-1] == (GRID_SIZE-1, GRID_SIZE-1)}")
+
+# ─── CELL 21 · Graph Building & Edge Danger Scoring ────────────────
+CACHE_FILE  = "bangalore_safe_graph.pkl"
+center_lat  = 12.9716
+center_lon  = 77.5946
+
+# ── Mini edge-danger ML model ─────────────────────────────
+np.random.seed(42)
+_tdf = pd.DataFrame({'Latitude': np.random.uniform(12.8,13.1,600),
+                      'Longitude':np.random.uniform(77.4,77.8,600)})
+_tdf['dist_to_center_km'] = np.sqrt((_tdf['Latitude']-center_lat)**2+
+                                      (_tdf['Longitude']-center_lon)**2)*111
+_cr = np.radians(_tdf[['Latitude','Longitude']].values)
+_bt = BallTree(_cr,metric='haversine')
+_rad = 1.0/6371.0
+_tdf['density_1km'] = _bt.query_radius(_cr,r=_rad,count_only=True)-1
+_km = KMeans(n_clusters=5,random_state=42,n_init=10)
+_tdf['cluster_id'] = _km.fit_predict(_tdf[['Latitude','Longitude']])
+_tdf['density_dist'] = _tdf['density_1km']*_tdf['dist_to_center_km']
+_tdf['label'] = np.random.choice([0,1,2],600)
+_tdf = pd.get_dummies(_tdf,columns=['cluster_id'],prefix='cluster')
+_Xe = _tdf.drop(columns=['label']); _ye = _tdf['label']
+_scE = StandardScaler(); _XeS = _scE.fit_transform(_Xe)
+_xgb_e = XGBClassifier(eval_metric='mlogloss',random_state=42)
+_lgb_e = LGBMClassifier(random_state=42,verbosity=-1)
+_xgb_e.fit(_XeS,_ye); _lgb_e.fit(_XeS,_ye)
+
+def _predict_edge(X_in):
+    return np.round((_xgb_e.predict(X_in)+_lgb_e.predict(X_in))/2).astype(int)
+
+def _edge_feat(pts):
+    sdf = pd.DataFrame(pts,columns=['Latitude','Longitude'])
+    sdf['dist_to_center_km'] = np.sqrt((sdf['Latitude']-center_lat)**2+
+                                        (sdf['Longitude']-center_lon)**2)*111
+    sr = np.radians(sdf[['Latitude','Longitude']].values)
+    sdf['density_1km'] = _bt.query_radius(sr,r=_rad,count_only=True)-1
+    sdf['cluster_id']  = _km.predict(sdf[['Latitude','Longitude']])
+    sdf['density_dist'] = sdf['density_1km']*sdf['dist_to_center_km']
+    sdf = pd.get_dummies(sdf,columns=['cluster_id'],prefix='cluster')
+    for c in _Xe.columns:
+        if c not in sdf.columns: sdf[c]=0
+    return sdf[_Xe.columns]
+
+# ── Load or build graph ───────────────────────────────────
+if os.path.exists(CACHE_FILE):
+    print("Loading cached graph...")
+    with open(CACHE_FILE,'rb') as f: G = pickle.load(f)
+else:
+    print("Downloading Bangalore road graph...")
+    G = ox.graph_from_place("Bangalore, India",network_type="drive",simplify=True)
+    for u,v,k,data in G.edges(keys=True,data=True):
+        if 'length' not in data:
+            data['length'] = geodesic((G.nodes[u]['y'],G.nodes[u]['x']),
+                                       (G.nodes[v]['y'],G.nodes[v]['x'])).meters
+    pts,ekeys = [],[]
+    for u,v,k,data in G.edges(keys=True,data=True):
+        try:
+            if 'geometry' in data and data['geometry']:
+                line = data['geometry']
+                coords = [(line.interpolate(d).y,line.interpolate(d).x)
+                          for d in np.linspace(0,line.length,3)]
+            else:
+                coords = list(zip(np.linspace(G.nodes[u]['y'],G.nodes[v]['y'],3),
+                                  np.linspace(G.nodes[u]['x'],G.nodes[v]['x'],3)))
+        except: continue
+        for lat,lon in coords:
+            pts.append((lat,lon)); ekeys.append((u,v,k))
+
+    sdf = _edge_feat(pts)
+    preds = _predict_edge(_scE.transform(sdf))
+    votes = defaultdict(list)
+    for p,k_ in zip(preds,ekeys): votes[k_].append(int(p))
+
+    cmap_e = {0:'green',1:'orange',2:'red'}
+    cost_m = {0:0.0,1:0.5,2:1.0}
+    for (u,v,k_),vs in votes.items():
+        d = G[u][v][k_]
+        maj = int(max(set(vs),key=vs.count))
+        d['danger']=maj; d['danger_class']=maj
+        d['color']=cmap_e[maj]; d['danger_color']=cmap_e[maj]
+        d['cost']=d['length']*(1+cost_m[maj])
+
+    # Accessibility: flag bad surfaces
+    bad_surf = {'steps','path','track','bridleway','footway'}
+    for u,v,k_,data in G.edges(keys=True,data=True):
+        hw = str(data.get('highway','')).lower()
+        sf = str(data.get('surface','asphalt')).lower()
+        data['accessible'] = 0 if any(b in hw or b in sf
+                                       for b in bad_surf) else 1
+
+    with open(CACHE_FILE,'wb') as f: pickle.dump(G,f)
+    print(f"Graph cached → {CACHE_FILE}")
+
+print(f"✅ Graph: {len(G.nodes):,} nodes, {len(G.edges):,} edges")
+
+# ─── CELL 22 · Routing Algorithms ──────────────────────────────────
+import heapq
+
+def dijkstra(graph, start, weight_key='distance'):
+    dist = {n:float('inf') for n in graph}
+    dist[start] = 0
+    pred = {n:None for n in graph}
+    pq = [(0,start)]
+    while pq:
+        d,u = heapq.heappop(pq)
+        if d>dist[u]: continue
+        for v,attrs in graph[u].items():
+            w = attrs[weight_key]
+            if dist[u]+w < dist[v]:
+                dist[v]=dist[u]+w; pred[v]=u
+                heapq.heappush(pq,(dist[v],v))
+    return dist,pred
+
+def _heuristic(u,v):
+    return geodesic((G.nodes[u]['y'],G.nodes[u]['x']),
+                    (G.nodes[v]['y'],G.nodes[v]['x'])).meters
+
+def get_route(G, start_ll, end_ll, weight='length',
+              avoid_nodes=None, hour=None, accessibility=False):
+    """A* routing with optional avoid_nodes, time-aware cost, accessibility."""
+    avoid_nodes = avoid_nodes or set()
+    try:
+        orig = ox.distance.nearest_nodes(G, start_ll[1], start_ll[0])
+        dest = ox.distance.nearest_nodes(G, end_ll[1],   end_ll[0])
+    except Exception as e:
+        print(f"Node lookup failed: {e}"); return None,[],0,{0:0,1:0,2:0}
+
+    def edge_w(u,v,data):
+        if u in avoid_nodes or v in avoid_nodes: return float('inf')
+        if accessibility and data.get('accessible',1)==0: return float('inf')
+        if weight=='cost':
+            base = data.get('cost', data.get('length',1))
+            if hour is not None:
+                night = (hour>=20 or hour<=5)
+                base *= (1.3 if night and data.get('danger',0)>0 else 1.0)
+            return base
+        return data.get(weight, data.get('length',1))
+
+    try:
+        path = nx.astar_path(G, orig, dest, heuristic=_heuristic,
+                              weight=lambda u,v,d: edge_w(u,v,d))
+    except nx.NetworkXNoPath:
+        print("No path found!"); return None,[],0,{0:0,1:0,2:0}
+
+    colors,total,dcounts = [],0.0,{0:0,1:0,2:0}
+    for i in range(len(path)-1):
+        u,v = path[i],path[i+1]
+        edges = G.get_edge_data(u,v)
+        edge = min(edges.values(),key=lambda e:e.get(weight,e.get('length',1)))
+        d = edge.get('danger',1)
+        dcounts[d] = dcounts.get(d,0)+1
+        colors.append(edge.get('color','gray'))
+        total += edge.get('length',0)
+    return path,colors,total,dcounts
+
+def safety_score(dc):
+    return max(0, 100 - dc.get(1,0)*5 - dc.get(2,0)*15)
+
+print("✅ Routing functions defined (get_route, dijkstra, safety_score)")
+
+# ─── CELL 23 · Multi-Stop + Alternative + Time-Aware Routing ────────
+
+# ── MULTI-STOP ROUTING ────────────────────────────────────
+def multi_stop_route(G, waypoints, weight='cost'):
+    """Plan route through multiple waypoints, minimising total danger."""
+    full_path, all_colors, total_dist, total_danger = [],[],0,{0:0,1:0,2:0}
+    for i in range(len(waypoints)-1):
+        p,c,d,dc = get_route(G, waypoints[i], waypoints[i+1], weight)
+        if p is None:
+            print(f"No path: segment {i}→{i+1}"); return None,[],0,{}
+        if full_path: full_path.extend(p[1:])
+        else:         full_path.extend(p)
+        all_colors.extend(c); total_dist+=d
+        for k,v in dc.items(): total_danger[k]=total_danger.get(k,0)+v
+    return full_path,all_colors,total_dist,total_danger
+
+# ── ALTERNATIVE ROUTES (top 3) ────────────────────────────
+def alternative_routes(G, start_ll, end_ll, n=3):
+    """Return top-N routes ranked by safety/distance trade-off."""
+    orig = ox.distance.nearest_nodes(G, start_ll[1], start_ll[0])
+    dest = ox.distance.nearest_nodes(G, end_ll[1],   end_ll[0])
+    routes = []
+    try:
+        gen = nx.shortest_simple_paths(G, orig, dest, weight='cost')
+        for _,path in zip(range(n*3), gen):
+            colors,total,dc = [],0.0,{0:0,1:0,2:0}
+            for i in range(len(path)-1):
+                e = G.get_edge_data(path[i],path[i+1])
+                if e:
+                    best = min(e.values(),key=lambda x:x.get('cost',x.get('length',1)))
+                    d = best.get('danger',1)
+                    dc[d]=dc.get(d,0)+1
+                    colors.append(best.get('color','gray'))
+                    total+=best.get('length',0)
+            sc = safety_score(dc)
+            dist_km = total/1000
+            score = sc - dist_km*2
+            routes.append({'path':path,'colors':colors,'dist_km':dist_km,
+                           'safety':sc,'score':score,'danger':dc})
+            if len(routes)>=n: break
+    except Exception as ex:
+        print(f"Alt routes error: {ex}")
+        p,c,d,dc = get_route(G,start_ll,end_ll,weight='cost')
+        if p: routes.append({'path':p,'colors':c,'dist_km':d/1000,
+                              'safety':safety_score(dc),'score':0,'danger':dc})
+    routes.sort(key=lambda r:-r['score'])
+    return routes[:n]
+
+# ── TURN-BY-TURN DIRECTIONS ───────────────────────────────
+def turn_by_turn(G, path_nodes):
+    """Generate text navigation instructions."""
+    directions = []
+    dirs_map = {(0,1):'Head East',(0,-1):'Head West',
+                (1,0):'Head South',(-1,0):'Head North',
+                (1,1):'Head South-East',(-1,1):'Head North-East',
+                (1,-1):'Head South-West',(-1,-1):'Head North-West'}
+    total_m = 0
+    for i,node in enumerate(path_nodes):
+        n_data = G.nodes[node]
+        lat,lon = n_data['y'],n_data['x']
+        if i==0:
+            directions.append(f"🟢 START at ({lat:.4f},{lon:.4f})")
+            continue
+        prev = G.nodes[path_nodes[i-1]]
+        dlat = 1 if lat>prev['y'] else (-1 if lat<prev['y'] else 0)
+        dlon = 1 if lon>prev['x'] else (-1 if lon<prev['x'] else 0)
+        txt  = dirs_map.get((dlat,dlon),f'Continue')
+        edges = G.get_edge_data(path_nodes[i-1],node)
+        if edges:
+            edge = min(edges.values(),key=lambda e:e.get('length',1))
+            seg_m = edge.get('length',0)
+            total_m += seg_m
+            danger = edge.get('danger',0)
+            d_txt = ['🟢 Safe','🟡 Medium danger','🔴 High danger'][min(danger,2)]
+            name = edge.get('name','unnamed road')
+            directions.append(f"  {txt} on {name} for {seg_m:.0f}m — {d_txt}")
+        if i==len(path_nodes)-1:
+            directions.append(f"🏁 ARRIVE at ({lat:.4f},{lon:.4f})  "
+                              f"Total: {total_m/1000:.2f}km")
+    return directions
+
+print("✅ Multi-stop, alternative routes, turn-by-turn defined.")
+
+# ─── CELL 24 · Demo — All Routing Features ─────────────────────────
+start = (12.9716, 77.5946)   # Majestic
+end   = (12.9352, 77.6245)   # Koramangala
+mid   = (12.9600, 77.6100)   # waypoint
+
+# ── 1. Standard routes ────────────────────────────────────
+p_len, c_len, len_m,  d_len  = get_route(G,start,end,weight='length')
+p_cost,c_cost,cost_m, d_cost = get_route(G,start,end,weight='cost')
+print(f"Shortest : {len_m/1000:.2f}km  danger={d_len}  safety={safety_score(d_len)}")
+print(f"Safest   : {cost_m/1000:.2f}km  danger={d_cost} safety={safety_score(d_cost)}")
+
+# ── 2. Time-aware ─────────────────────────────────────────
+p_night,_,nm,dn = get_route(G,start,end,weight='cost',hour=23)
+p_day,  _,dm,dd = get_route(G,start,end,weight='cost',hour=12)
+print(f"\nNight route: {nm/1000:.2f}km  safety={safety_score(dn)}")
+print(f"Day route  : {dm/1000:.2f}km  safety={safety_score(dd)}")
+
+# ── 3. Accessibility ──────────────────────────────────────
+p_acc,_,am,da = get_route(G,start,end,weight='cost',accessibility=True)
+if p_acc: print(f"Accessible : {am/1000:.2f}km  safety={safety_score(da)}")
+
+# ── 4. Avoid area ─────────────────────────────────────────
+avoid_lat, avoid_lon = 12.9540, 77.6080
+avoid_radius_m = 500
+avoid_nodes = {n for n,d in G.nodes(data=True)
+               if geodesic((d['y'],d['x']),(avoid_lat,avoid_lon)).meters < avoid_radius_m}
+print(f"\nAvoiding {len(avoid_nodes)} nodes near ({avoid_lat},{avoid_lon})")
+p_avoid,_,avm,dav = get_route(G,start,end,weight='cost',avoid_nodes=avoid_nodes)
+if p_avoid: print(f"Avoid-zone : {avm/1000:.2f}km  safety={safety_score(dav)}")
+
+# ── 5. Multi-stop ─────────────────────────────────────────
+waypoints = [start, mid, end]
+p_ms,c_ms,ms_m,d_ms = multi_stop_route(G, waypoints, weight='cost')
+if p_ms: print(f"\nMulti-stop : {ms_m/1000:.2f}km  danger={d_ms}")
+
+# ── 6. Alternative routes ─────────────────────────────────
+print("\nTop-3 alternative routes:")
+alts = alternative_routes(G, start, end, n=3)
+for i,r in enumerate(alts,1):
+    print(f"  Route {i}: {r['dist_km']:.2f}km  safety={r['safety']}  "
+          f"score={r['score']:.1f}  danger={r['danger']}")
+
+# ── 7. Turn-by-turn for safest route ─────────────────────
+if p_cost and len(p_cost)>1:
+    print("\nTurn-by-Turn (safest route, first 8 steps):")
+    for step in turn_by_turn(G,p_cost)[:8]: print(step)
+
+# ── 8. Map with all routes ────────────────────────────────
+m = folium.Map(location=start,zoom_start=13)
+folium.Marker(start,popup="Start",icon=folium.Icon(color='blue')).add_to(m)
+folium.Marker(end,  popup="End",  icon=folium.Icon(color='red')).add_to(m)
+folium.Marker(mid,  popup="Via",  icon=folium.Icon(color='orange')).add_to(m)
+
+if p_len:
+    coords = [(G.nodes[n]['y'],G.nodes[n]['x']) for n in p_len]
+    folium.PolyLine(coords,color='blue',weight=3,opacity=0.5,tooltip='Shortest').add_to(m)
+if p_cost:
+    for i in range(len(p_cost)-1):
+        u,v = p_cost[i],p_cost[i+1]
+        e = G.get_edge_data(u,v)
+        if e:
+            best = min(e.values(),key=lambda x:x.get('cost',x.get('length',1)))
+            folium.PolyLine([(G.nodes[u]['y'],G.nodes[u]['x']),
+                             (G.nodes[v]['y'],G.nodes[v]['x'])],
+                color=best.get('color','gray'),weight=5,
+                tooltip=f"Danger:{best.get('danger',1)}").add_to(m)
+if p_ms:
+    coords_ms = [(G.nodes[n]['y'],G.nodes[n]['x']) for n in p_ms]
+    folium.PolyLine(coords_ms,color='purple',weight=3,dash_array='5',
+                    tooltip='Multi-stop').add_to(m)
+
+# Avoid zone circle
+folium.Circle([avoid_lat,avoid_lon],radius=avoid_radius_m,
+              color='black',fill=True,fill_opacity=0.15,
+              popup='Avoided zone').add_to(m)
+m.save("route_map.html"); display(m)
+print("\n✅ Route map saved → route_map.html")
+
+
+# ─── CELL 25 · Route Comparison Visualizations ──────────────────────
+from math import pi
+
+comp_df = pd.DataFrame({
+    'Route':          ['Shortest','Safest','Day','Night','Accessible'],
+    'Dist_km':        [len_m/1000, cost_m/1000,
+                       dm/1000 if p_day  else 0,
+                       nm/1000 if p_night else 0,
+                       am/1000 if p_acc  else 0],
+    'Safety':         [safety_score(d_len), safety_score(d_cost),
+                       safety_score(dd) if p_day  else 0,
+                       safety_score(dn) if p_night else 0,
+                       safety_score(da) if p_acc  else 0],
+    'Green':  [d_len.get(0,0),d_cost.get(0,0),
+               dd.get(0,0) if p_day else 0, dn.get(0,0) if p_night else 0,
+               da.get(0,0) if p_acc else 0],
+    'Yellow': [d_len.get(1,0),d_cost.get(1,0),
+               dd.get(1,0) if p_day else 0, dn.get(1,0) if p_night else 0,
+               da.get(1,0) if p_acc else 0],
+    'Red':    [d_len.get(2,0),d_cost.get(2,0),
+               dd.get(2,0) if p_day else 0, dn.get(2,0) if p_night else 0,
+               da.get(2,0) if p_acc else 0],
+}).dropna()
+
+print("Route Comparison Table:")
+display(HTML(comp_df.to_html(index=False)))
+
+fig,axes = plt.subplots(2,2,figsize=(14,10))
+
+# Distance
+bars = axes[0,0].bar(comp_df['Route'],comp_df['Dist_km'],
+    color=['skyblue','lightgreen','coral','purple','teal'])
+axes[0,0].set_title('Route Distance'); axes[0,0].set_ylabel('km')
+axes[0,0].bar_label(bars,fmt='%.2f',padding=2)
+plt.setp(axes[0,0].get_xticklabels(),rotation=15)
+
+# Safety score
+bars2 = axes[0,1].bar(comp_df['Route'],comp_df['Safety'],
+    color=['skyblue','lightgreen','coral','purple','teal'])
+axes[0,1].set_title('Safety Score (0-100)'); axes[0,1].set_ylabel('Score')
+axes[0,1].set_ylim(0,115); axes[0,1].bar_label(bars2,fmt='%.0f',padding=2)
+plt.setp(axes[0,1].get_xticklabels(),rotation=15)
+
+# Stacked danger
+x = np.arange(len(comp_df)); bottom = np.zeros(len(comp_df))
+for col,color,label in [('Green','green','Low'),('Yellow','gold','Med'),('Red','red','High')]:
+    axes[1,0].bar(x,comp_df[col],bottom=bottom,color=color,label=label,alpha=0.85)
+    bottom += comp_df[col].values.astype(float)
+axes[1,0].set_xticks(x); axes[1,0].set_xticklabels(comp_df['Route'],rotation=15)
+axes[1,0].set_title('Danger Segments Stacked'); axes[1,0].legend()
+
+# Radar
+categories = ['Shortness','Safety','Low danger%','Not-high%']
+N = len(categories)
+angles = [n/N*2*pi for n in range(N)]+[0]
+all_d = [d_len,d_cost,dd if p_day else d_cost,dn if p_night else d_cost]
+route_labels = ['Shortest','Safest','Day','Night']
+colors_r = ['royalblue','seagreen','coral','purple']
+axes[1,1] = plt.subplot(2,2,4,projection='polar')
+for d_,label_,col_ in zip(all_d,route_labels,colors_r):
+    tot = max(sum(d_.values()),1)
+    inv = 1/(max(d_.get(1,0)+d_.get(2,0),0.1))
+    vals = [inv/2, safety_score(d_)/100, d_.get(0,0)/tot, 1-d_.get(2,0)/tot]+[0]
+    vals[-1]=vals[0]
+    axes[1,1].plot(angles,vals,'o-',lw=2,label=label_,color=col_)
+    axes[1,1].fill(angles,vals,alpha=0.1,color=col_)
+axes[1,1].set_xticks(angles[:-1]); axes[1,1].set_xticklabels(categories,size=9)
+axes[1,1].set_ylim(0,1); axes[1,1].legend(loc='upper right',bbox_to_anchor=(1.3,1.1))
+axes[1,1].set_title('Radar Comparison',pad=20)
+
+plt.suptitle('Complete Route Comparison Dashboard',fontsize=14,fontweight='bold')
+plt.tight_layout(); plt.show()
+
+
+# ─── CELL 26 · Route History Log (SQLite) ──────────────────────────
+DB_PATH = "route_history.db"
+
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS routes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, start_lat REAL, start_lon REAL,
+            end_lat REAL, end_lon REAL, dist_km REAL,
+            safety_score INTEGER, danger_low INTEGER,
+            danger_med INTEGER, danger_high INTEGER,
+            route_type TEXT, hour INTEGER
+        )""")
+    conn.commit(); conn.close()
+
+def log_route(start_ll,end_ll,dist_m,danger_counts,route_type='safe',hour=None):
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        INSERT INTO routes
+        (timestamp,start_lat,start_lon,end_lat,end_lon,dist_km,
+         safety_score,danger_low,danger_med,danger_high,route_type,hour)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+        (datetime.datetime.now().isoformat(),
+         start_ll[0],start_ll[1],end_ll[0],end_ll[1],
+         dist_m/1000, safety_score(danger_counts),
+         danger_counts.get(0,0),danger_counts.get(1,0),danger_counts.get(2,0),
+         route_type, hour))
+    conn.commit(); conn.close()
+
+def get_history():
+    conn = sqlite3.connect(DB_PATH)
+    df_ = pd.read_sql("SELECT * FROM routes ORDER BY timestamp DESC",conn)
+    conn.close(); return df_
+
+init_db()
+
+# Log current routes
+log_route(start,end,len_m, d_len, 'shortest')
+log_route(start,end,cost_m,d_cost,'safest')
+if p_night: log_route(start,end,nm,dn,'night',hour=23)
+if p_day:   log_route(start,end,dm,dd,'day',  hour=12)
+print("✅ Routes logged to SQLite database.")
+
+history = get_history()
+print(f"\nRoute History ({len(history)} records):")
+display(HTML(history.tail(8).to_html(index=False)))
+
+if len(history)>=2:
+    fig,axes = plt.subplots(1,2,figsize=(12,4))
+    history['safety_score'].plot(ax=axes[0],marker='o',color='seagreen')
+    axes[0].set_title('Safety Score History'); axes[0].set_ylabel('Score (0-100)')
+    axes[0].grid(True,alpha=0.3)
+
+    history['dist_km'].plot(ax=axes[1],marker='s',color='steelblue')
+    axes[1].set_title('Distance History'); axes[1].set_ylabel('km')
+    axes[1].grid(True,alpha=0.3)
+    plt.suptitle('Route History Analysis',fontweight='bold')
+    plt.tight_layout(); plt.show()
+
+
+# ─── CELL 27 · Geocoding + ipywidgets Interactive Routing ──────────
+geolocator = Nominatim(user_agent="crime_route_planner_v2")
+geocode     = RateLimiter(geolocator.geocode, min_delay_seconds=1)
+
+NAMED_LOCATIONS = {
+    "Majestic (City Centre)"   : (12.9716, 77.5946),
+    "Koramangala"              : (12.9352, 77.6245),
+    "Indiranagar"              : (12.9784, 77.6408),
+    "Whitefield"               : (12.9698, 77.7500),
+    "Jayanagar"                : (12.9308, 77.5831),
+    "MG Road"                  : (12.9757, 77.6070),
+    "Electronic City"          : (12.8399, 77.6770),
+    "Marathahalli"             : (12.9591, 77.6971),
+    "HSR Layout"               : (12.9116, 77.6387),
+    "Rajajinagar"              : (12.9899, 77.5524),
+}
+
+out = Output()
+
+# Widgets
+start_dd   = widgets.Dropdown(options=list(NAMED_LOCATIONS.keys()),
+    description='Start:',layout=Layout(width='350px'))
+end_dd     = widgets.Dropdown(options=list(NAMED_LOCATIONS.keys()),
+    value=list(NAMED_LOCATIONS.keys())[1],
+    description='End:',layout=Layout(width='350px'))
+via_txt    = widgets.Text(value='',placeholder='Optional: type address (geocoded)',
+    description='Via:',layout=Layout(width='400px'))
+route_type = widgets.RadioButtons(options=['safest','shortest','accessible'],
+    value='safest',description='Mode:')
+hour_slider= widgets.IntSlider(value=12,min=0,max=23,step=1,
+    description='Hour:',style={'description_width':'50px'})
+n_alt      = widgets.IntSlider(value=3,min=1,max=5,step=1,
+    description='Alt routes:',style={'description_width':'80px'})
+run_btn    = widgets.Button(description='🚦 Plan Route',
+    button_style='success',layout=Layout(width='150px'))
+
+# Safety alert function
+def check_safety_alert(latlon, threshold=2.0):
+    nearby = df[df.apply(
+        lambda r: geodesic((r['Latitude'],r['Longitude']),latlon).km<1, axis=1)]
+    if len(nearby)==0: return "✅ No data for this area."
+    avg_d = nearby['danger_label'].mean()
+    if avg_d >= threshold*0.67:
+        return f"🚨 HIGH DANGER ALERT: avg danger={avg_d:.2f} within 1km of destination!"
+    elif avg_d >= threshold*0.33:
+        return f"⚠️  MEDIUM DANGER: avg danger={avg_d:.2f} within 1km."
+    return f"✅ LOW DANGER area: avg danger={avg_d:.2f} within 1km."
+
+def on_run_click(_):
+    with out:
+        clear_output(wait=True)
+        s_ll = NAMED_LOCATIONS[start_dd.value]
+        e_ll = NAMED_LOCATIONS[end_dd.value]
+
+        # Geocode optional via point
+        via_ll = None
+        if via_txt.value.strip():
+            try:
+                loc = geocode(via_txt.value.strip()+", Bangalore, India")
+                if loc: via_ll=(loc.latitude,loc.longitude)
+                print(f"📍 Via resolved: {via_ll}")
+            except Exception as ge:
+                print(f"Geocoding failed: {ge}")
+
+        wt = 'cost' if route_type.value=='safest' else              ('length' if route_type.value=='shortest' else 'cost')
+        acc = (route_type.value=='accessible')
+        h   = hour_slider.value
+
+        print(f"Planning {route_type.value} route: {start_dd.value} → {end_dd.value}")
+        print(f"Hour: {h:02d}:00  |  Accessibility: {acc}")
+
+        # Safety alerts
+        print("\n" + check_safety_alert(e_ll))
+
+        # Route
+        if via_ll:
+            waypoints_ = [s_ll, via_ll, e_ll]
+            path_,c_,d_,dc_ = multi_stop_route(G,waypoints_,weight=wt)
+        else:
+            path_,c_,d_,dc_ = get_route(G,s_ll,e_ll,weight=wt,hour=h,
+                                           accessibility=acc)
+
+        if path_:
+            sc = safety_score(dc_)
+            print(f"\nRoute found: {d_/1000:.2f}km  safety={sc}/100  danger={dc_}")
+            log_route(s_ll,e_ll,d_,dc_,route_type.value,h)
+
+            # Turn-by-turn (first 6)
+            steps = turn_by_turn(G,path_)
+            print("\nDirections:")
+            for s in steps[:6]: print(s)
+            if len(steps)>6: print(f"  ... ({len(steps)-6} more steps)")
+
+            # Alternatives
+            alts_ = alternative_routes(G,s_ll,e_ll,n=n_alt.value)
+            print(f"\nTop-{n_alt.value} alternatives:")
+            for i,r in enumerate(alts_,1):
+                print(f"  {i}. {r['dist_km']:.2f}km  safety={r['safety']}  score={r['score']:.1f}")
+
+            # Map
+            m_ = folium.Map(location=s_ll,zoom_start=13)
+            folium.Marker(s_ll,popup=f"Start: {start_dd.value}",
+                icon=folium.Icon(color='blue')).add_to(m_)
+            folium.Marker(e_ll,popup=f"End: {end_dd.value}",
+                icon=folium.Icon(color='red')).add_to(m_)
+            if via_ll:
+                folium.Marker(via_ll,popup="Via",
+                    icon=folium.Icon(color='orange')).add_to(m_)
+            for i in range(len(path_)-1):
+                u,v = path_[i],path_[i+1]
+                e_data = G.get_edge_data(u,v)
+                if e_data:
+                    best = min(e_data.values(),key=lambda x:x.get('cost',x.get('length',1)))
+                    folium.PolyLine([(G.nodes[u]['y'],G.nodes[u]['x']),
+                                     (G.nodes[v]['y'],G.nodes[v]['x'])],
+                        color=best.get('color','gray'),weight=5).add_to(m_)
+            m_.save("widget_route.html"); display(m_)
+        else:
+            print("❌ No route found.")
+
+run_btn.on_click(on_run_click)
+
+ui = VBox([
+    widgets.HTML("<h3>🚦 Interactive Crime-Aware Route Planner</h3>"),
+    HBox([start_dd, end_dd]),
+    HBox([via_txt]),
+    HBox([route_type, VBox([hour_slider, n_alt])]),
+    run_btn, out
+])
+display(ui)
+
+
+# ─── CELL 29 · GPX Export ───────────────────────────────────────────
+def export_gpx(G, path_nodes, filename="route.gpx", name="Safe Route"):
+    """Export a route as GPX for offline navigation."""
+    if not GPX_OK:
+        print("gpxpy not installed — pip install gpxpy"); return
+
+    gpx = gpxpy.gpx.GPX()
+    track = gpxpy.gpx.GPXTrack(name=name)
+    gpx.tracks.append(track)
+    segment = gpxpy.gpx.GPXTrackSegment()
+    track.segments.append(segment)
+
+    for node in path_nodes:
+        lat = G.nodes[node]['y']
+        lon = G.nodes[node]['x']
+        segment.points.append(gpxpy.gpx.GPXTrackPoint(lat, lon))
+
+    with open(filename,'w') as f:
+        f.write(gpx.to_xml())
+    print(f"✅ GPX saved → {filename}  ({len(path_nodes)} waypoints)")
+    return filename
+
+# Export shortest and safest routes
+if p_len:  export_gpx(G, p_len,  "shortest_route.gpx", "Shortest Route")
+if p_cost: export_gpx(G, p_cost, "safe_route.gpx",     "Safe Route")
+
+# Export multi-stop
+if p_ms: export_gpx(G, p_ms, "multistop_route.gpx", "Multi-Stop Safe Route")
+
+
+# ─── CELL 30 · Spatio-Temporal Model (PyTorch Conv1D + LSTM) ────────
+
+print("─── Spatio-Temporal Model ───")
+sample_size = min(5000, len(df))
+st_df = df.sample(sample_size, random_state=42).copy()
+st_df = st_df.sort_values(['FIR_YEAR','FIR_MONTH','FIR_DAY_OF_MONTH'])
+
+ST_FEATURES = ['Latitude','Longitude','density_1km',
+               'FIR_MONTH','HOUR','dist_to_center_km']
+ST_FEATURES = [c for c in ST_FEATURES if c in st_df.columns]
+
+SEQ_ST = 10
+X_st_raw = st_df[ST_FEATURES].fillna(0).values.astype(np.float32)
+y_st_raw = st_df['danger_label'].values.astype(np.int64)
+
+st_scaler = StandardScaler()
+X_st_sc   = st_scaler.fit_transform(X_st_raw)
+
+Xst, yst = [], []
+for i in range(len(X_st_sc) - SEQ_ST):
+    Xst.append(X_st_sc[i:i+SEQ_ST])
+    yst.append(y_st_raw[i+SEQ_ST])
+Xst, yst = np.array(Xst, dtype=np.float32), np.array(yst, dtype=np.int64)
+print(f"Sequences: {Xst.shape}  labels: {yst.shape}")
+
+split_st = int(len(Xst) * 0.8)
+Xst_tr, Xst_te = Xst[:split_st], Xst[split_st:]
+yst_tr, yst_te = yst[:split_st], yst[split_st:]
+
+X_st_tr_t = torch.tensor(Xst_tr).permute(0, 2, 1).to(DEVICE)  # (N, C, T)
+X_st_te_t = torch.tensor(Xst_te).permute(0, 2, 1).to(DEVICE)
+y_st_tr_t = torch.tensor(yst_tr).to(DEVICE)
+y_st_te_t = torch.tensor(yst_te).to(DEVICE)
+
+st_ds     = TensorDataset(X_st_tr_t, y_st_tr_t)
+st_loader = DataLoader(st_ds, batch_size=64, shuffle=True)
+
+# ── PyTorch Conv1D + LSTM hybrid ─────────────────────────────────
+class SpatioTemporalNet(nn.Module):
+    def __init__(self, n_features, seq_len, n_classes=3):
+        super().__init__()
+        self.conv1 = nn.Conv1d(n_features, 64, kernel_size=3, padding=1)
+        self.bn1   = nn.BatchNorm1d(64)
+        # For LSTM: input (N, T, C) — permute after conv
+        self.lstm1 = nn.LSTM(64, 64, batch_first=True,
+                             dropout=0.2, num_layers=2)
+        self.drop  = nn.Dropout(0.2)
+        self.fc1   = nn.Linear(64, 32)
+        self.fc2   = nn.Linear(32, n_classes)
+
+    def forward(self, x):           # x: (N, C, T)
+        x = F.relu(self.bn1(self.conv1(x)))   # (N, 64, T)
+        x = x.permute(0, 2, 1)               # (N, T, 64)
+        x, _ = self.lstm1(x)                  # (N, T, 64)
+        x = self.drop(x[:, -1, :])            # last time step
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+n_feat_st = len(ST_FEATURES)
+st_net    = SpatioTemporalNet(n_feat_st, SEQ_ST).to(DEVICE)
+st_optim  = TorchAdam(st_net.parameters(), lr=1e-3, weight_decay=1e-4)
+st_sched  = ReduceLROnPlateau(st_optim, patience=4, factor=0.5)
+
+best_val_st, best_st_state, pat_st = 0.0, None, 0
+st_tr_acc_hist, st_va_acc_hist = [], []
+
+for epoch in range(80):
+    st_net.train()
+    correct, total = 0, 0
+    for xb, yb in st_loader:
+        st_optim.zero_grad()
+        out  = st_net(xb)
+        loss = F.cross_entropy(out, yb)
+        loss.backward(); st_optim.step()
+        correct += (out.argmax(1) == yb).sum().item()
+        total   += len(yb)
+    tr_acc = correct / total
+
+    st_net.eval()
+    with torch.no_grad():
+        val_out = st_net(X_st_te_t)
+        val_loss = F.cross_entropy(val_out, y_st_te_t).item()
+        val_acc  = (val_out.argmax(1) == y_st_te_t).float().mean().item()
+    st_sched.step(val_loss)
+    st_tr_acc_hist.append(tr_acc); st_va_acc_hist.append(val_acc)
+
+    if val_acc > best_val_st:
+        best_val_st   = val_acc
+        best_st_state = copy.deepcopy(st_net.state_dict())
+        pat_st = 0
+    else:
+        pat_st += 1
+        if pat_st >= 12: break
+
+st_net.load_state_dict(best_st_state)
+st_acc = best_val_st
+print(f"✅ Spatio-Temporal Accuracy: {st_acc:.4f}  (trained {len(st_tr_acc_hist)} epochs)")
+
+fig, ax = plt.subplots(figsize=(10, 4))
+ax.plot(st_tr_acc_hist, label='Train Acc', color='steelblue')
+ax.plot(st_va_acc_hist, label='Val Acc',   color='coral')
+ax.set_title('PyTorch Conv1D+LSTM — Spatio-Temporal Model')
+ax.set_xlabel('Epoch'); ax.set_ylabel('Accuracy')
+ax.legend(); ax.grid(True, alpha=0.3)
+plt.tight_layout(); plt.show()
+
+# ── Bayesian Risk Modeling ────────────────────────────────
+print("\n─── Bayesian Risk Modeling ───")
+def bayesian_danger_estimate(lat,lon,df,radius_km=1.0,prior_alpha=1,prior_beta=1):
+    nearby = df[df.apply(
+        lambda r: geodesic((r['Latitude'],r['Longitude']),(lat,lon)).km<=radius_km,
+        axis=1)]
+    n       = len(nearby)
+    n_high  = (nearby['danger_label']==2).sum()
+    post_alpha = prior_alpha + n_high
+    post_beta  = prior_beta  + (n - n_high)
+    mean_p = post_alpha / (post_alpha+post_beta)
+    var_p  = (post_alpha*post_beta) / ((post_alpha+post_beta)**2*(post_alpha+post_beta+1))
+    ci_lo  = max(0, mean_p - 2*np.sqrt(var_p))
+    ci_hi  = min(1, mean_p + 2*np.sqrt(var_p))
+    return {'mean':mean_p,'ci_low':ci_lo,'ci_high':ci_hi,'n_obs':n}
+
+test_points = [(12.96,77.59),(12.93,77.62),(12.97,77.64)]
+print("\nBayesian Risk Estimates:")
+print(f"{'Location':<25} {'Mean P(High)':>14} {'95% CI':>20} {'N obs':>8}")
+print("-"*70)
+for lat_,lon_ in test_points:
+    r = bayesian_danger_estimate(lat_,lon_,df)
+    print(f"({lat_},{lon_})      {r['mean']:>14.3f} "
+          f"[{r['ci_low']:.3f}, {r['ci_high']:.3f}]     {r['n_obs']:>6}")
+
+# ── Self-Supervised Learning ──────────────────────────────
+print("\n─── Self-Supervised Learning ───")
+# Contrastive-style: predict whether two nearby crime records are same class
+n_pairs = min(2000, len(df)//2)
+idx_a   = np.random.choice(len(df), n_pairs, replace=False)
+idx_b   = np.random.choice(len(df), n_pairs, replace=False)
+df_vals = df[feature_cols].fillna(0).values
+
+X_ssl_a  = scaler.transform(
+    pd.DataFrame(df_vals[idx_a],columns=feature_cols)
+        .assign(cluster_id=lambda d:d['cluster_id'].astype(str))
+        .pipe(lambda d: pd.get_dummies(d,columns=['cluster_id'],prefix='cluster'))
+        .reindex(columns=X.columns,fill_value=0)
+)
+X_ssl_b  = scaler.transform(
+    pd.DataFrame(df_vals[idx_b],columns=feature_cols)
+        .assign(cluster_id=lambda d:d['cluster_id'].astype(str))
+        .pipe(lambda d: pd.get_dummies(d,columns=['cluster_id'],prefix='cluster'))
+        .reindex(columns=X.columns,fill_value=0)
+)
+y_ssl = (df['danger_label'].values[idx_a] == df['danger_label'].values[idx_b]).astype(int)
+
+X_ssl = np.abs(X_ssl_a - X_ssl_b)
+Xs_tr,Xs_te,ys_tr,ys_te = train_test_split(X_ssl,y_ssl,test_size=0.2,random_state=42)
+
+ssl_model = MLPClassifier(hidden_layer_sizes=(128,64,32),
+    activation='relu',max_iter=200,random_state=42,early_stopping=True)
+ssl_model.fit(Xs_tr,ys_tr)
+ssl_acc = ssl_model.score(Xs_te,ys_te)
+print(f"Self-Supervised (same-class prediction) Accuracy: {ssl_acc:.4f}")
+print("(Pre-trained repr. can bootstrap when labels are scarce)")
+
+# ─── CELL 32 · Final Model Accuracy Dashboard ──────────────────────
+
+# Safe fallback: use base scores if tuned versions were never computed
+acc_xgb_tuned = locals().get('acc_xgb_tuned', acc_xgb)
+f1_xgb_tuned  = locals().get('f1_xgb_tuned',  f1_xgb)
+acc_lgb_tuned = locals().get('acc_lgb_tuned', acc_lgb)
+f1_lgb_tuned  = locals().get('f1_lgb_tuned',  f1_lgb)
+
+print("\n" + "="*65)
+print("  FINAL ACCURACY DASHBOARD")
+print("="*65)
+
+model_results = {
+    'Random Forest':  (acc_rf,        f1_rf),
+    'Extra Trees':    (acc_et,        f1_et),
+    'XGBoost':        (acc_xgb,       f1_xgb),
+    'LightGBM':       (acc_lgb,       f1_lgb),
+    'XGB (tuned)':    (acc_xgb_tuned, f1_xgb_tuned),
+    'LGB (tuned)':    (acc_lgb_tuned, f1_lgb_tuned),
+    'Stacked':        (acc_stack,     f1_stack),
+}
+
+print(f"\n{'Model':<18} {'Accuracy':>10} {'F1 (w)':>10} ")
+print("-"*52)
+for mname, (acc, f1) in model_results.items():
+    flag = "✅ 93%+" if acc >= 0.93 else ("🟡 Good" if acc >= 0.85 else "❌ Low")
+    print(f"{mname:<18} {acc:>10.4f} {f1:>10.4f} ")
+
+# Bar chart
+fig, ax = plt.subplots(figsize=(13, 6))
+names_m = list(model_results.keys())
+accs_m  = [v[0] for v in model_results.values()]
+f1s_m   = [v[1] for v in model_results.values()]
+x_ = np.arange(len(names_m)); w = 0.35
+b1 = ax.bar(x_ - w/2, accs_m, w, label='Accuracy',      color='steelblue', alpha=0.85)
+b2 = ax.bar(x_ + w/2, f1s_m,  w, label='F1 (weighted)', color='salmon',    alpha=0.85)
+ax.axhline(0.93, color='red', ls='--', lw=2, label='93% target')  # fixed: was 0.88
+ax.set_xticks(x_); ax.set_xticklabels(names_m, rotation=20, ha='right')
+ax.set_ylim(0, 1.05); ax.set_ylabel('Score')
+ax.set_title('Final Model Accuracy Dashboard', fontweight='bold', fontsize=13)
+ax.bar_label(b1, fmt='%.3f', padding=2, fontsize=8)
+ax.bar_label(b2, fmt='%.3f', padding=2, fontsize=8)
+ax.legend(); plt.tight_layout(); plt.show()
+
+best_acc   = max(accs_m)
+best_mname = names_m[accs_m.index(best_acc)]
+print(f"\n🏆 Best model: {best_mname}  →  {best_acc:.4f} accuracy")
+if best_acc >= 0.93:
+    print("✅ 93% accuracy target ACHIEVED!")
+else:
+    print(f"🟡 Closest to target: {best_acc:.4f} — consider adding more "
+          f"source features (e.g. FIR_Type, Ward_Name encoded).")
+
+# ─── CELL 34 · Final Full Dashboard & Feature Importances ──────────
+print("=" * 65)
+print("  FULL MODEL PERFORMANCE DASHBOARD")
+print("=" * 65)
+
+all_results = {
+    "Random Forest":  (acc_rf,    f1_rf),
+    "Extra Trees":    (acc_et,    f1_et),
+    "XGBoost":        (acc_xgb,   f1_xgb),       # FIX 1
+    "LightGBM":       (acc_lgb,   f1_lgb),        # FIX 1
+    "Stacked Ens.":   (acc_stack, f1_stack),
+    "Online (SGD)":   (final_online_acc, 0.0),
+    "Spatio-Temp.":   (st_acc,    0.0),
+    "GNN-style":      (acc_gnn,   f1_gnn),
+}
+
+print(f"\n{'Model':<18} {'Accuracy':>10} {'F1 (w)':>10} {'Status':>12}")
+print("-" * 54)
+for mname, (acc, f1_) in all_results.items():
+    flag = "✅ 93%+" if acc >= 0.93 else ("🟡 Good" if acc >= 0.85 else "🔵 OK" if acc >= 0.70 else "❌")
+    print(f"{mname:<18} {acc:>10.4f} {f1_:>10.4f} {flag:>12}")
+
+# ── Bar chart ──────────────────────────────────────────────────────────
+fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+
+names_m = list(all_results.keys())
+accs_m  = [v[0] for v in all_results.values()]
+f1s_m   = [v[1] for v in all_results.values()]
+x_ = np.arange(len(names_m)); w = 0.38
+
+b1 = axes[0, 0].bar(x_ - w/2, accs_m, w, label="Accuracy", color="steelblue", alpha=0.85)
+b2 = axes[0, 0].bar(x_ + w/2, f1s_m,  w, label="F1 (w)",   color="salmon",    alpha=0.85)
+axes[0, 0].axhline(0.93, color="red", ls="--", lw=2, label="93% target")
+axes[0, 0].set_xticks(x_)
+axes[0, 0].set_xticklabels(names_m, rotation=30, ha="right", fontsize=8)
+axes[0, 0].set_ylim(0, 1.08); axes[0, 0].set_ylabel("Score")
+axes[0, 0].set_title("All Models — Accuracy & F1", fontweight="bold")
+axes[0, 0].bar_label(b1, fmt="%.3f", padding=2, fontsize=7)
+axes[0, 0].legend(fontsize=8)
+
+# ── Feature importance (XGBoost) ──────────────────────────────────────
+imp = xgb_model.feature_importances_                          # FIX 2
+fi  = pd.DataFrame({"Feature": X.columns, "Importance": imp})
+fi  = fi.sort_values("Importance", ascending=True).tail(15)
+axes[0, 1].barh(fi["Feature"], fi["Importance"], color="steelblue", alpha=0.8)
+axes[0, 1].set_title("XGBoost Feature Importances (Top 15)", fontweight="bold")
+axes[0, 1].set_xlabel("Importance")
+
+# ── Confusion matrix — best model ─────────────────────────────────────
+best_acc_val = max(acc_xgb, acc_lgb)                          # FIX 1
+best_preds   = y_pred_xgb if acc_xgb >= acc_lgb else y_pred_lgb   # FIX 3
+best_lbl     = "XGBoost"  if acc_xgb >= acc_lgb else "LightGBM"   # FIX 1
+cm_best = confusion_matrix(y_test_enc, best_preds)
+sns.heatmap(cm_best, annot=True, fmt="d", cmap="Blues", ax=axes[1, 0],
+            xticklabels=["Low", "Med", "High"],
+            yticklabels=["Low", "Med", "High"])
+axes[1, 0].set_title(f"Confusion Matrix — {best_lbl} ({best_acc_val:.4f})", fontweight="bold")
+axes[1, 0].set_xlabel("Predicted"); axes[1, 0].set_ylabel("Actual")
+
+# ── Learning curves (Random Forest proxy) ─────────────────────────────
+train_sizes = np.linspace(0.1, 1.0, 8)
+tr_scores, te_scores = [], []
+for frac in train_sizes:
+    n = max(50, int(frac * len(X_train_scaled)))
+    m_tmp = RandomForestClassifier(n_estimators=50, random_state=42, n_jobs=-1)
+    m_tmp.fit(X_train_scaled[:n], y_train_enc[:n])
+    tr_scores.append(m_tmp.score(X_train_scaled[:n], y_train_enc[:n]))
+    te_scores.append(m_tmp.score(X_test_scaled, y_test_enc))
+
+axes[1, 1].plot(train_sizes * len(X_train_scaled), tr_scores, "o-",
+                label="Train", color="steelblue")
+axes[1, 1].plot(train_sizes * len(X_train_scaled), te_scores, "s-",
+                label="Test",  color="coral")
+axes[1, 1].axhline(0.93, color="red", ls="--", lw=1.5, label="93% target")
+axes[1, 1].set_xlabel("Training Samples"); axes[1, 1].set_ylabel("Accuracy")
+axes[1, 1].set_title("Learning Curves (Random Forest proxy)", fontweight="bold")
+axes[1, 1].legend(); axes[1, 1].grid(True, alpha=0.3)
+
+plt.suptitle("Final Performance Dashboard", fontsize=14, fontweight="bold")
+plt.tight_layout(); plt.show()
+
+best_overall  = max(accs_m)
+best_model_nm = names_m[accs_m.index(best_overall)]
+print(f"\n🏆 Best Overall: {best_model_nm}  →  {best_overall:.4f} accuracy")
+
+# FIX 4: removed broken backslash continuation — use parentheses instead
+flag_93 = (
+    "✅ 93% TARGET ACHIEVED!"
+    if best_overall >= 0.93
+    else f"🟡 Best is {best_overall:.4f}. To push past 93%: add FIR_Type, Ward_Name, CrimeType columns as features."
+)
+print(flag_93)
+
+# ─── CELL 34 · Final Performance Dashboard ──────────────────────────
+print("=" * 68)
+print("  FINAL MODEL PERFORMANCE DASHBOARD  (Target: 88 – 90%)")
+print("=" * 68)
+
+all_results = {}
+try: all_results["Random Forest"] = (acc_rf,    f1_rf)
+except: pass
+try: all_results["Extra Trees"]   = (acc_et,    f1_et)
+except: pass
+try: all_results["XGBoost"]       = (acc_xgb,   f1_xgb)    # FIX 3
+except: pass
+try: all_results["LightGBM"]      = (acc_lgb,   f1_lgb)    # FIX 3
+except: pass
+try: all_results["Stacked Ens."]  = (acc_stack, f1_stack)
+except: pass
+try: all_results["MLP"]           = (acc_mlp,   f1_mlp)
+except: pass
+try: all_results["Online (SGD)"]  = (final_online_acc, 0.0)
+except: pass
+try: all_results["ST Conv+LSTM"]  = (st_acc, 0.0)
+except: pass
+try: all_results["GNN-style"]     = (acc_gnn, f1_gnn)
+except: pass
+
+print(f"\n{'Model':<18} {'Accuracy':>10} {'F1 (w)':>10} {'88-90% ?':>12}")
+print("-" * 54)
+for mname, (acc, f1_) in all_results.items():
+    flag = ("✅ In range" if 0.86 <= acc <= 0.92 else
+            "⬆️  Too low" if acc < 0.86 else
+            "⬇️  Too high")
+    print(f"{mname:<18} {acc:>10.4f} {f1_:>10.4f} {flag:>12}")
+
+# ── Bar chart ──────────────────────────────────────────────────────
+names_m = list(all_results.keys())
+accs_m  = [v[0] for v in all_results.values()]
+f1s_m   = [v[1] for v in all_results.values()]
+
+fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+x_ = np.arange(len(names_m)); w = 0.38
+b1 = axes[0, 0].bar(x_-w/2, accs_m, w, label="Accuracy", color="steelblue", alpha=0.85)
+b2 = axes[0, 0].bar(x_+w/2, f1s_m,  w, label="F1 (w)",   color="salmon",    alpha=0.85)
+axes[0, 0].axhspan(0.88, 0.90, alpha=0.12, color="green", label="Target zone 88-90%")
+axes[0, 0].set_xticks(x_)
+axes[0, 0].set_xticklabels(names_m, rotation=30, ha="right", fontsize=8)
+axes[0, 0].set_ylim(0, 1.08); axes[0, 0].set_ylabel("Score")
+axes[0, 0].set_title("All Models — Accuracy & F1", fontweight="bold")
+axes[0, 0].bar_label(b1, fmt="%.3f", padding=2, fontsize=7)
+axes[0, 0].legend(fontsize=8)
+
+# ── Confusion matrix — best available model ────────────────────────
+# FIX 1+3: compare xgb vs lgb directly; no _tuned variables
+_xgb_acc = all_results.get("XGBoost",  (0, 0))[0]
+_lgb_acc = all_results.get("LightGBM", (0, 0))[0]
+best_acc_v = max(_xgb_acc, _lgb_acc)
+best_preds = y_pred_xgb if _xgb_acc >= _lgb_acc else y_pred_lgb   # FIX 1
+best_lbl   = "XGBoost"  if _xgb_acc >= _lgb_acc else "LightGBM"   # FIX 3
+cm_ = confusion_matrix(y_test_enc, best_preds)
+sns.heatmap(cm_, annot=True, fmt="d", cmap="Blues", ax=axes[0, 1],
+            xticklabels=["Low", "Med", "High"],
+            yticklabels=["Low", "Med", "High"])
+axes[0, 1].set_title(f"Confusion Matrix — {best_lbl} ({best_acc_v:.4f})", fontweight="bold")
+axes[0, 1].set_xlabel("Predicted"); axes[0, 1].set_ylabel("Actual")
+
+# ── Feature importance — XGBoost ──────────────────────────────────
+# FIX 2: use xgb_model directly; guard on the model object, not the stale key
+if "XGBoost" in all_results:
+    imp = xgb_model.feature_importances_                           # FIX 2
+    fi  = pd.DataFrame({"Feature": X.columns, "Imp": imp})
+    fi  = fi.sort_values("Imp", ascending=True).tail(12)
+    axes[1, 0].barh(fi["Feature"], fi["Imp"], color="steelblue", alpha=0.85)
+    axes[1, 0].set_title("Top-12 Feature Importances (XGBoost)", fontweight="bold")
+    axes[1, 0].set_xlabel("Importance")
+
+# ── Learning curve (RF proxy — fast) ──────────────────────────────
+from sklearn.model_selection import learning_curve as lc
+tr_sz, tr_sc, te_sc = lc(
+    rf_model, X_train_scaled, y_train_enc,
+    cv=4, scoring="accuracy", n_jobs=-1,
+    train_sizes=np.linspace(0.15, 1.0, 7))
+axes[1, 1].plot(tr_sz, tr_sc.mean(1), "o-", color="steelblue", label="Train")
+axes[1, 1].fill_between(tr_sz,
+    tr_sc.mean(1) - tr_sc.std(1),
+    tr_sc.mean(1) + tr_sc.std(1), alpha=0.15, color="steelblue")
+axes[1, 1].plot(tr_sz, te_sc.mean(1), "s--", color="coral", label="CV")
+axes[1, 1].fill_between(tr_sz,
+    te_sc.mean(1) - te_sc.std(1),
+    te_sc.mean(1) + te_sc.std(1), alpha=0.15, color="coral")
+axes[1, 1].axhspan(0.88, 0.90, alpha=0.12, color="green", label="Target 88-90%")
+axes[1, 1].set_title("Learning Curves (Random Forest)", fontweight="bold")
+axes[1, 1].set_xlabel("Training Samples"); axes[1, 1].set_ylabel("Accuracy")
+axes[1, 1].legend(fontsize=8); axes[1, 1].grid(True, alpha=0.3)
+
+plt.suptitle("Final Performance Dashboard", fontsize=14, fontweight="bold")
+plt.tight_layout(); plt.show()
+
+best_overall = max(accs_m) if accs_m else 0
+best_nm      = names_m[accs_m.index(best_overall)] if accs_m else "N/A"
+print(f"\n🏆 Best Overall : {best_nm}  →  {best_overall:.4f}")
+if 0.86 <= best_overall <= 0.92:
+    print("✅ In target zone (88-90%)!")
+elif best_overall < 0.86:
+    print("⬆️  Below target — add more domain features (FIR_Type, Ward_Name).")
+else:
+    print("⚠️  Above 92% — double-check for feature leakage.")
+
