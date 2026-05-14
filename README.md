@@ -258,6 +258,5 @@ This project is developed for educational, research, and academic purposes.
 
 We sincerely thank our mentors, guides, internship coordinators, and team members for their continuous support and guidance throughout the successful development of NYVRA.
 
-Heatmap + Route Optimization
    ↓
 Emergency SOS & Alerts
